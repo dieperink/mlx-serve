@@ -41,6 +41,11 @@ final class VideoGenService: ObservableObject {
     @Published private(set) var recent: [String] = []
     @Published private(set) var log: [String] = []
     @Published private(set) var residency: Residency? = nil
+    /// The running window's Pause control.
+    @Published private(set) var pause = VideoPause()
+    /// The running window's job id from its `job` event; nil while it cannot be paused.
+    @Published private(set) var pauseJob: String? = nil
+    private var pausePort: UInt16 = 0
 
     private var task: Task<Void, Never>?
     private let api = APIClient()
@@ -57,6 +62,7 @@ final class VideoGenService: ObservableObject {
         default:
             livePreview = nil
             readout = nil
+            clearPause()
         }
     }
 
@@ -80,6 +86,33 @@ final class VideoGenService: ObservableObject {
     var isRunning: Bool {
         if case .running = phase { return true }
         return false
+    }
+
+    var canPause: Bool { isRunning && pauseJob != nil }
+
+    /// Pause at the end of the step that is running; chat keeps the GPU meanwhile.
+    func requestPause() { sendPause(true) { $0.request() } }
+    /// Withdraw a pause the server has not taken yet.
+    func cancelPause() { sendPause(false) { $0.withdraw() } }
+    func resume() { sendPause(false) { $0.resume() } }
+
+    private func sendPause(_ on: Bool, _ change: (inout VideoPause) -> Void) {
+        guard let id = pauseJob else { return }
+        let before = pause, port = pausePort
+        change(&pause)
+        Task {
+            do {
+                try await api.setVideoPause(port: port, id: id, pause: on)
+            } catch {
+                // The job ended before the request landed: nothing to pause any more.
+                if pauseJob == id { pause = before }
+            }
+        }
+    }
+
+    private func clearPause() {
+        pause = VideoPause()
+        pauseJob = nil
     }
 
     /// Generate through the ONE main server: ensure running (headless if
@@ -234,9 +267,26 @@ final class VideoGenService: ObservableObject {
         // A chained run's events name their window; events between windows keep the last one.
         var window: Int? = nil, windows: Int? = nil
         let startedAt = ProcessInfo.processInfo.systemUptime
+        var heldSeconds = 0.0
+        defer { if gen == generationSeq { clearPause() } }
         for try await ev in api.streamGeneration(
             port: port, path: "/v1/video/generations", json: body) {
             switch ev["type"] as? String {
+            case "job":
+                // A LAN peer's job id means nothing to the local server.
+                if gen == generationSeq, request.lanModelId == nil, let id = ev["id"] as? String {
+                    pause = VideoPause()
+                    pauseJob = id
+                    pausePort = port
+                }
+            case "paused":
+                if gen == generationSeq { pause.serverPaused(at: ProcessInfo.processInfo.systemUptime) }
+            case "resumed":
+                guard gen == generationSeq else { break }
+                let held = pause.serverResumed(at: ProcessInfo.processInfo.systemUptime)
+                clock.excludePause(held)
+                heldSeconds += held
+                self.startedAt += held
             case "progress":
                 let step = ev["step"] as? Int ?? 0
                 let total = ev["total"] as? Int ?? steps
@@ -276,7 +326,7 @@ final class VideoGenService: ObservableObject {
         // estimate is measured rather than extrapolated. Recorded from
         // the SAMPLING span only — the encode after this is ours, not the
         // model's, and the estimate does not include it.
-        Self.recordRun(request, steps: steps, measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
+        Self.recordRun(request, steps: steps, measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt - heldSeconds)
         return frames
     }
 

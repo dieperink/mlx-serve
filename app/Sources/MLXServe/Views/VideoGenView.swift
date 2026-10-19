@@ -2159,6 +2159,7 @@ struct VideoGenView: View {
         VStack(spacing: 8) {
             HStack {
                 if service.isRunning {
+                    if service.canPause { pauseButton }
                     Button(role: .destructive) {
                         service.cancel()
                     } label: {
@@ -2188,6 +2189,10 @@ struct VideoGenView: View {
                 Text("\(VideoModelPreset.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows)) frames at \(effectiveSize.width) × \(effectiveSize.height) is more than one response can carry. Shorten the clip, drop a window, or use a smaller canvas.")
                     .font(.app(.caption2)).foregroundStyle(.orange)
             }
+            if service.canPause, service.pause.state == .pausing {
+                Text("Pausing after this step")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            }
             if !service.isRunning, let est = timeEstimate {
                 Text(L10n.text(est))
                     .font(.app(.caption))
@@ -2195,6 +2200,30 @@ struct VideoGenView: View {
                     .help("Time is estimated from measured runs and this Mac's GPU, and varies with what else is using the GPU. Peak memory usage is the most memory this size and length are planned to need.")
             }
         }
+    }
+
+    @ViewBuilder private var pauseButton: some View {
+        Group {
+            switch service.pause.state {
+            case .running:
+                Button { service.requestPause() } label: {
+                    Label("Pause", systemImage: "pause.circle").font(.app(.body))
+                        .frame(maxWidth: .infinity)
+                }
+                .help("Pauses after the current step. Chat keeps working while paused; the model stays in memory.")
+            case .pausing:
+                Button { service.cancelPause() } label: {
+                    Label("Cancel pause", systemImage: "arrow.uturn.backward.circle").font(.app(.body))
+                        .frame(maxWidth: .infinity)
+                }
+            case .paused:
+                Button { service.resume() } label: {
+                    Label("Resume", systemImage: "play.circle").font(.app(.body))
+                        .frame(maxWidth: .infinity)
+                }
+            }
+        }
+        .buttonStyle(.bordered)
     }
 
     private var previewArea: some View {
@@ -2228,9 +2257,13 @@ struct VideoGenView: View {
                                 .frame(width: 240)
                         }
                         HStack(spacing: 4) {
-                            Text(message)
-                            Text(verbatim: "·")
-                            Text(service.startedAt, style: .timer).monospacedDigit()
+                            if service.pause.state == .paused {
+                                Text("Paused")
+                            } else {
+                                Text(message)
+                                Text(verbatim: "·")
+                                Text(service.startedAt, style: .timer).monospacedDigit()
+                            }
                         }
                         .font(.app(.footnote)).foregroundStyle(.secondary)
                     }

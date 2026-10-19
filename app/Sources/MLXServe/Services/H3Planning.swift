@@ -483,6 +483,11 @@ struct H3StepClock {
         if openingLap { openingLap = false } else { laps.append(lap) }
     }
 
+    /// Time the job sat paused counts toward no lap.
+    mutating func excludePause(_ seconds: Double) {
+        if let s = lastStamp { lastStamp = s + seconds }
+    }
+
     /// The mean step lap, or nil before there are two: the same amortized step
     /// cost `liveEta` prices what is left with.
     var secondsPerStep: Double? {
