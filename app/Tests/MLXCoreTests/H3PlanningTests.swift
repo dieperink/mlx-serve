@@ -88,6 +88,24 @@ final class H3PlanningTests: XCTestCase {
                        String(format: "%.0f GB peak memory usage", held))
     }
 
+    /// On disk the cache holds one block in memory, so the bill drops all but a fiftieth of it.
+    func testCacheOnDiskBillsOneBlockOfTheCache() {
+        let rows = H3Plan.rows(width: 1344, height: 768, frames: 209, promptTokens: 250)
+        for q8 in [false, true] {
+            XCTAssertEqual(H3Plan.pabCacheBytes(rows: rows, cache8bit: q8, onDisk: true) * UInt64(H3Plan.blocks),
+                           H3Plan.pabCacheBytes(rows: rows, cache8bit: q8))
+        }
+        let gb: UInt64 = 1_000_000_000
+        let ram = H3Plan.peakBytes(model: h3, width: 1344, height: 768, frames: 209, fast: true)
+        let disk = H3Plan.peakBytes(model: h3, width: 1344, height: 768, frames: 209, fast: true, cacheOnDisk: true)
+        XCTAssertGreaterThan(ram - disk, 30 * gb)
+        XCTAssertNotEqual(H3Plan.describePeak(model: h3, width: 1344, height: 768, shotFrames: [209], fast: true),
+                          H3Plan.describePeak(model: h3, width: 1344, height: 768, shotFrames: [209], fast: true, cacheOnDisk: true))
+        // Without the fast recipe there is no cache to place anywhere.
+        XCTAssertEqual(H3Plan.peakBytes(model: h3, width: 1344, height: 768, frames: 209, fast: false),
+                       H3Plan.peakBytes(model: h3, width: 1344, height: 768, frames: 209, fast: false, cacheOnDisk: true))
+    }
+
     func testSamplingBillCoversTheMeasuredStepPeak() {
         let gib = 1024.0 * 1024.0 * 1024.0
         let peak = Double(H3Plan.peakBytes(model: h3q4, width: 1120, height: 640, frames: 192, fast: true,

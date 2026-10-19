@@ -2293,6 +2293,8 @@
 "Shows a rough still of each step while it runs, about 1% slower. The finished clip comes out sharper than the preview." = "运行时显示每一步的粗略静帧，速度约慢 1%。完成的片段比预览更清晰。";
 "Adapter files (.safetensors) that change the look or teach the model a subject. Up to 8 stack, each with its own strength." = "用于改变画面风格或教模型认识某个主体的适配器文件（.safetensors）。最多可叠加 8 个，各自设置强度。";
 "Quantize the attention cache" = "量化注意力缓存";
+"Keep the attention cache on disk" = "将注意力缓存保存在磁盘上";
+"Writes the attention cache to disk and reads it back per block: almost no memory for the cache, the same video, no measurable slowdown on a fast SSD. Needs free disk space the size of the cache." = "将注意力缓存写入磁盘并逐块读回：缓存几乎不占内存，视频相同，在快速 SSD 上没有可测的减速。需要与缓存大小相当的可用磁盘空间。";
 "Cancel pause" = "取消暂停";
 "Pausing after this step" = "将在此步骤结束后暂停";
 "Pauses after the current step. Chat keeps working while paused; the model stays in memory." = "在当前步骤结束后暂停。暂停期间聊天仍可使用，模型保留在内存中。";

@@ -50,6 +50,7 @@ const sse = @import("gen_sse.zig");
 const server_mod = @import("server.zig");
 const multipart = @import("multipart.zig");
 const discovery = @import("model_discovery.zig");
+const kv_disk_cache = @import("kv_disk_cache.zig");
 const stb = @import("stb");
 const webp = @import("webp");
 
@@ -3927,6 +3928,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     const turbo = sse.bodyWantsTrue(body, "turbo");
     const stream_weights = h3StreamWeights(body);
     const attn_cache_8bit = sse.bodyWantsTrue(body, "attn_cache_8bit");
+    const attn_cache_disk = sse.bodyWantsTrue(body, "attn_cache_disk");
     if (turbo and !engine.hasTurboLora(io, allocator))
         return sendError(conn, 400, "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
 
@@ -4057,9 +4059,22 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // resident plan, and when that does not fit, each stage is checked here, before any loads: the
     // Metal OOM mid-step is uncatchable and takes the whole server down.
     const speed = minimax_h3.resolveSpeed(sse.bodyBool(body, "fast"), turbo, minimax_h3.envStr("MINIMAX_H3_STEP_CACHE"), minimax_h3.envStr("MINIMAX_H3_ATTN_BCAST"));
-    const cfg = minimax_h3.Config{};
-    const bcast_row: u64 = if (speed.bcast_k > 0) minimax_h3.AttnBroadcast.rowBytes(cfg.hidden_size, cfg.num_layers, attn_cache_8bit) else 0;
     const rows = h3RequestRows(width, height, shape.frame_count, @intCast(n_kf));
+    var cache_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const attn_cache_dir: ?[]const u8 = if (attn_cache_disk and speed.bcast_k > 1) blk: {
+        const home = std.mem.span(std.c.getenv("HOME") orelse return sendError(conn, 500, "no HOME for the attention cache on disk"));
+        const dir = std.fmt.bufPrint(&cache_dir_buf, "{s}/.mlx-serve/cache", .{home}) catch return sendError(conn, 500, "attention cache path too long");
+        std.Io.Dir.cwd().createDirPath(io, dir) catch return sendError(conn, 500, "cannot create ~/.mlx-serve/cache for the attention cache");
+        const need = h3BcastDiskBytes(rows, attn_cache_8bit);
+        if (kv_disk_cache.volumeSpace(dir)) |vs| if (vs.free < need + (2 << 30)) {
+            var msg: [256]u8 = undefined;
+            return sendErrorType(conn, 400, "insufficient_storage", std.fmt.bufPrint(&msg, "the attention cache on disk needs ~{d:.1} GB but {d:.1} GB is free: free some disk space or turn off \"attn_cache_disk\"", .{
+                @as(f64, @floatFromInt(need)) / (1 << 30), @as(f64, @floatFromInt(vs.free)) / (1 << 30),
+            }) catch "not enough free disk for the attention cache");
+        };
+        break :blk dir;
+    } else null;
+    const bcast_row = h3BcastRowBytes(speed.bcast_k, attn_cache_8bit, attn_cache_dir != null);
     const activations = h3ActivationBytes(rows, bcast_row);
     const plan = h3ResidentFor(engine, io, allocator, activations);
     var reason_buf: [384]u8 = undefined;
@@ -4092,7 +4107,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             const fix = switch (stage) {
                 .text_encoder => "\"stream_weights\": true streams it from disk",
                 .vae => "use a smaller canvas or fewer frames",
-                .denoise => if (!stream_weights) "use a smaller canvas or fewer frames, or \"stream_weights\": true" else if (with_cache) "use a smaller canvas or fewer frames, or \"turbo\", which keeps no attention cache" else "use a smaller canvas or fewer frames",
+                .denoise => if (!stream_weights) "use a smaller canvas or fewer frames, or \"stream_weights\": true" else if (with_cache and attn_cache_dir == null) "use a smaller canvas or fewer frames, or \"attn_cache_disk\": true, which keeps the attention cache on disk" else if (with_cache) "use a smaller canvas or fewer frames, or \"turbo\", which keeps no attention cache" else "use a smaller canvas or fewer frames",
             };
             const msg = std.fmt.bufPrint(&msg_buf, "{s}: {s}", .{ reason, fix }) catch reason;
             return sendErrorType(conn, 400, "insufficient_memory", msg);
@@ -4125,6 +4140,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         .turbo = turbo,
         .stream_weights = stream_weights,
         .attn_cache_8bit = attn_cache_8bit,
+        .attn_cache_dir = attn_cache_dir,
         .lora_paths = lora_paths[0..lora_n],
         .lora_scales = lora_scales[0..lora_n],
         .chain_windows = chain_windows,
@@ -5038,6 +5054,20 @@ const H3_REQUEST_BASE_BYTES: u64 = 5 << 29;
 
 pub fn h3ActivationBytes(rows: u64, bcast_row_bytes: u64) u64 {
     return H3_REQUEST_BASE_BYTES + rows * (H3_ROW_BYTES + bcast_row_bytes);
+}
+
+/// Bytes per sequence row the attention cache holds in memory: every block's, or the one block in
+/// flight when the cache is on disk (`attn_cache_disk`). Zero when the recipe keeps no cache.
+pub fn h3BcastRowBytes(bcast_k: u32, q8: bool, on_disk: bool) u64 {
+    if (bcast_k <= 1) return 0;
+    const cfg = minimax_h3.Config{};
+    return minimax_h3.AttnBroadcast.rowBytes(cfg.hidden_size, if (on_disk) 1 else cfg.num_layers, q8);
+}
+
+/// The scratch file an on-disk attention cache fills: every block's rows, each array page-aligned.
+pub fn h3BcastDiskBytes(rows: u64, q8: bool) u64 {
+    const cfg = minimax_h3.Config{};
+    return rows * minimax_h3.AttnBroadcast.rowBytes(cfg.hidden_size, cfg.num_layers, q8) + @as(u64, cfg.num_layers) * 3 * (64 << 10);
 }
 
 /// What MiniMax-H3 holds when it keeps every piece loaded between requests: the text encoder, the
@@ -7051,6 +7081,18 @@ test "h3 streamed DiT bills what stays resident and still covers the measured de
         const bill = @as(f64, @floatFromInt(dit + h3ActivationBytes(r.rows, q8))) / GiB;
         try std.testing.expect(bill >= r.peak and bill < r.peak + 5.0);
     }
+}
+
+test "h3 attention cache on disk bills one block in memory and every block on the disk" {
+    const GiB: u64 = 1 << 30;
+    const rows = h3RequestRows(1344, 768, 209, 0);
+    const ram = h3BcastRowBytes(2, false, false);
+    try std.testing.expectEqual(ram, h3BcastRowBytes(2, false, true) * (minimax_h3.Config{}).num_layers);
+    try std.testing.expect(h3ActivationBytes(rows, ram) - h3ActivationBytes(rows, h3BcastRowBytes(2, false, true)) > 19 * GiB);
+    try std.testing.expect(h3BcastDiskBytes(rows, false) >= rows * ram);
+    try std.testing.expect(h3BcastDiskBytes(rows, true) < h3BcastDiskBytes(rows, false));
+    // No cache without the broadcast recipe, wherever it would live.
+    try std.testing.expectEqual(@as(u64, 0), h3BcastRowBytes(1, true, true));
 }
 
 test "h3 stream_weights defaults on, and a request can keep the weights resident" {

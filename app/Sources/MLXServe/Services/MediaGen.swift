@@ -2433,6 +2433,9 @@ struct VideoGenRequest {
     /// H3's fast-recipe attention cache stored 8-bit (`attn_cache_8bit`): about
     /// half its memory, slightly lossy. Sent only when on.
     var attnCache8bit: Bool = false
+    /// H3's fast-recipe attention cache kept in a scratch file (`attn_cache_disk`): memory holds
+    /// one block of it. Sent only when on.
+    var attnCacheDisk: Bool = false
     /// Whether the server runs H3's fast recipe: "Compute every step in full" and Turbo both turn it off.
     var fastRecipe: Bool { !bestQuality && !turbo }
     /// Chained windows (H3 fl2va): number of `numFrames`-frame windows joined
@@ -2667,11 +2670,12 @@ enum RAMChecker {
     /// 124-frame floor, so it fires always). A backend with its own memory
     /// model answers for itself.
     static func safeFrameCap(model: VideoModelPreset, width: Int, height: Int, available: Int,
-                             fast: Bool = true, streamWeights: Bool = true, cache8bit: Bool = false) -> Int {
+                             fast: Bool = true, streamWeights: Bool = true, cache8bit: Bool = false,
+                             cacheOnDisk: Bool = false) -> Int {
         if model.backend == .minimaxH3 {
             return H3Plan.frameCap(model: model, width: width, height: height,
                                    availableGB: available, fast: fast, streamWeights: streamWeights,
-                                   cache8bit: cache8bit)
+                                   cache8bit: cache8bit, cacheOnDisk: cacheOnDisk)
         }
         let pixelMP = Double(width * height) / 1_000_000.0
         let headroom = max(0, available - model.approxRAMGB)

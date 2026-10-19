@@ -27,6 +27,7 @@
 //!      uniformly spaced.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
@@ -2175,19 +2176,82 @@ pub const AttnBroadcast = struct {
     /// biases) when `q8` and the width groups by 64, else bf16 in `w` alone; null ctx = empty.
     blocks: []Entry,
     q8: bool,
+    /// Where the entries live when the cache is on disk (`attn_cache_disk`): one scratch file,
+    /// unlinked at open so it goes with the process; memory then holds one block's entry at a time.
+    spill: ?Spill = null,
 
-    const Entry = struct { w: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array };
+    const Entry = struct { w: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array, slot: ?Slot = null };
     const GROUP = 64;
     const empty: mlx.mlx_array = .{ .ctx = null };
 
-    pub fn init(allocator: std.mem.Allocator, n_blocks: usize, q8: bool) !AttnBroadcast {
+    /// A block's place in the scratch file and the arrays it holds there, page-aligned each.
+    const Slot = struct {
+        off: u64,
+        cap: u64,
+        n: u8 = 0,
+        parts: [3]Part = undefined,
+    };
+    const Part = struct { shape: [4]c_int, ndim: u8, dtype: mlx.mlx_dtype, bytes: usize };
+
+    const Spill = struct {
+        fd: std.c.fd_t,
+        /// End of the allocated slots.
+        end: u64 = 0,
+
+        fn open(dir: []const u8) !Spill {
+            if (comptime builtin.os.tag == .windows) return error.AttnCacheDiskUnsupported;
+            var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+            const S0 = struct {
+                var seq = std.atomic.Value(u32).init(0);
+            };
+            const path = try std.fmt.bufPrintSentinel(&buf, "{s}/h3-attn-{d}-{d}.bin", .{ dir, std.c.getpid(), S0.seq.fetchAdd(1, .monotonic) }, 0);
+            const fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
+            if (fd < 0) return error.AttnCacheDiskOpen;
+            _ = std.c.unlink(path);
+            if (comptime builtin.os.tag.isDarwin()) _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
+            return .{ .fd = fd };
+        }
+
+        fn writeAll(self: *const Spill, buf: []const u8, off: u64) !void {
+            var done: usize = 0;
+            while (done < buf.len) {
+                const n = std.c.pwrite(self.fd, buf[done..].ptr, buf.len - done, @intCast(off + done));
+                if (n < 0) {
+                    if (std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
+                    return error.AttnCacheDiskWrite;
+                }
+                done += @intCast(n);
+            }
+        }
+
+        fn readAll(self: *const Spill, buf: []u8, off: u64) !void {
+            var done: usize = 0;
+            while (done < buf.len) {
+                const n = std.c.pread(self.fd, buf[done..].ptr, buf.len - done, @intCast(off + done));
+                if (n < 0) {
+                    if (std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
+                    return error.AttnCacheDiskRead;
+                }
+                if (n == 0) return error.AttnCacheDiskRead;
+                done += @intCast(n);
+            }
+        }
+    };
+
+    /// `spill_dir` puts the cache in a scratch file there instead of in memory.
+    pub fn init(allocator: std.mem.Allocator, n_blocks: usize, q8: bool, spill_dir: ?[]const u8) !AttnBroadcast {
+        const spill: ?Spill = if (spill_dir) |d| try Spill.open(d) else null;
+        errdefer if (spill) |sp| {
+            _ = std.c.close(sp.fd);
+        };
         const blocks = try allocator.alloc(Entry, n_blocks);
         for (blocks) |*b| b.* = .{ .w = empty, .scales = empty, .biases = empty };
-        return .{ .allocator = allocator, .blocks = blocks, .q8 = q8 };
+        return .{ .allocator = allocator, .blocks = blocks, .q8 = q8, .spill = spill };
     }
     pub fn deinit(self: *AttnBroadcast) void {
         for (self.blocks) |*b| freeEntry(b);
         self.allocator.free(self.blocks);
+        if (self.spill) |sp| _ = std.c.close(sp.fd);
     }
     fn freeEntry(b: *Entry) void {
         inline for (.{ &b.w, &b.scales, &b.biases }) |p| if (p.ctx != null) {
@@ -2203,21 +2267,28 @@ pub const AttnBroadcast = struct {
     }
 
     pub fn has(self: *const AttnBroadcast, bi: usize) bool {
-        return self.blocks[bi].w.ctx != null;
+        const b = self.blocks[bi];
+        return b.w.ctx != null or (b.slot != null and b.slot.?.n > 0);
     }
 
     /// Caches `at` for block `bi`, replacing the last refresh. Returns `at` itself (owned), tied to
     /// the cache write so the 8-bit copy is made while `at` is live and its bf16 buffer can go.
+    /// On disk the entry is evaluated and written here, so nothing of it stays in memory.
     pub fn store(self: *AttnBroadcast, bi: usize, at: mlx.mlx_array, s: S) !mlx.mlx_array {
         const b = &self.blocks[bi];
         freeEntry(b);
         const shape = mlx.mlx_array_shape(at);
         const width = shape[mlx.mlx_array_ndim(at) - 1];
         if (!self.q8 or @mod(width, GROUP) != 0) {
-            b.w = mlx.mlx_array_new();
-            _ = mlx.mlx_array_set(&b.w, at);
+            b.w = if (self.spill != null) try contig(at, s) else blk: {
+                var w = mlx.mlx_array_new();
+                _ = mlx.mlx_array_set(&w, at);
+                break :blk w;
+            };
             var out = mlx.mlx_array_new();
-            _ = mlx.mlx_array_set(&out, at);
+            _ = mlx.mlx_array_set(&out, if (self.spill != null) b.w else at);
+            errdefer _ = mlx.mlx_array_free(out);
+            if (self.spill != null) try self.spillEntry(b);
             return out;
         }
         var triple = mlx.mlx_vector_array_new();
@@ -2226,6 +2297,13 @@ pub const AttnBroadcast = struct {
         inline for (.{ &b.w, &b.scales, &b.biases }, 0..) |p, k| {
             p.* = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(p, triple, k));
+        }
+        if (self.spill != null) {
+            var out = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&out, at);
+            errdefer _ = mlx.mlx_array_free(out);
+            try self.spillEntry(b);
+            return out;
         }
         const iv = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{at}, 1);
         defer _ = mlx.mlx_vector_array_free(iv);
@@ -2240,9 +2318,93 @@ pub const AttnBroadcast = struct {
         return out;
     }
 
+    /// Evaluates `b`'s arrays, writes them to the block's slot and frees them.
+    fn spillEntry(self: *AttnBroadcast, b: *Entry) !void {
+        const sp = &self.spill.?;
+        const page: u64 = std.heap.pageSize();
+        const arrs = [_]mlx.mlx_array{ b.w, b.scales, b.biases };
+        const n: usize = if (b.scales.ctx == null) 1 else 3;
+        const vec = mlx.mlx_vector_array_new_data(&arrs, n);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        var need: u64 = 0;
+        for (arrs[0..n]) |x| need += std.mem.alignForward(u64, nbytes(x), page);
+        var slot: Slot = b.slot orelse .{ .off = sp.end, .cap = 0 };
+        if (need > slot.cap) {
+            slot = .{ .off = sp.end, .cap = need };
+            sp.end += need;
+            if (std.c.ftruncate(sp.fd, @intCast(sp.end)) != 0) return error.AttnCacheDiskWrite;
+        }
+        var off = slot.off;
+        slot.n = 0;
+        for (arrs[0..n], 0..) |x, k| {
+            const len = nbytes(x);
+            const ptr = rawData(x) orelse return error.AttnCacheDiskWrite;
+            try sp.writeAll(ptr[0..len], off);
+            var part: Part = .{ .shape = .{ 0, 0, 0, 0 }, .ndim = @intCast(mlx.mlx_array_ndim(x)), .dtype = mlx.mlx_array_dtype(x), .bytes = len };
+            @memcpy(part.shape[0..part.ndim], mlx.mlx_array_shape(x)[0..part.ndim]);
+            slot.parts[k] = part;
+            off += std.mem.alignForward(u64, len, page);
+        }
+        slot.n = @intCast(n);
+        b.slot = slot;
+        freeEntry(b);
+    }
+
+    fn nbytes(x: mlx.mlx_array) usize {
+        return mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+    }
+    fn rawData(x: mlx.mlx_array) ?[*]const u8 {
+        return switch (mlx.mlx_array_dtype(x)) {
+            .uint32 => @ptrCast(mlx.mlx_array_data_uint32(x) orelse return null),
+            .bfloat16 => @ptrCast(mlx.mlx_array_data_bfloat16(x) orelse return null),
+            .float16 => @ptrCast(mlx.mlx_array_data_float16(x) orelse return null),
+            .float32 => @ptrCast(mlx.mlx_array_data_float32(x) orelse return null),
+            else => null,
+        };
+    }
+
+    /// A page-aligned buffer MLX wraps without a copy and frees through `release`.
+    const Held = struct { mem: []u8 };
+    fn release(payload: ?*anyopaque) callconv(.c) void {
+        const h: *Held = @ptrCast(@alignCast(payload.?));
+        std.heap.page_allocator.free(h.mem);
+        std.heap.c_allocator.destroy(h);
+    }
+
+    fn readPart(self: *const AttnBroadcast, part: Part, off: u64) !mlx.mlx_array {
+        const page = std.heap.pageSize();
+        const mem = try std.heap.page_allocator.alloc(u8, std.mem.alignForward(usize, part.bytes, page));
+        errdefer std.heap.page_allocator.free(mem);
+        try self.spill.?.readAll(mem, off);
+        const h = try std.heap.c_allocator.create(Held);
+        h.* = .{ .mem = mem };
+        const arr = mlx.mlx_array_new_data_managed_payload(mem.ptr, &part.shape, part.ndim, part.dtype, h, release);
+        if (arr.ctx == null) {
+            std.heap.c_allocator.destroy(h);
+            return error.AttnCacheDiskRead;
+        }
+        return arr;
+    }
+
     /// The cached output of block `bi` in bf16, owned by the caller.
     pub fn load(self: *const AttnBroadcast, bi: usize, s: S) !mlx.mlx_array {
-        const b = self.blocks[bi];
+        var b = self.blocks[bi];
+        var read: [3]mlx.mlx_array = .{ empty, empty, empty };
+        defer for (read) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+        if (b.w.ctx == null) if (b.slot) |slot| {
+            const page: u64 = std.heap.pageSize();
+            var off = slot.off;
+            for (slot.parts[0..slot.n], 0..) |part, k| {
+                read[k] = try self.readPart(part, off);
+                off += std.mem.alignForward(u64, part.bytes, page);
+            }
+            b.w = read[0];
+            b.scales = read[1];
+            b.biases = read[2];
+        };
         var out = mlx.mlx_array_new();
         if (b.scales.ctx == null) {
             _ = mlx.mlx_array_set(&out, b.w);
@@ -2253,11 +2415,11 @@ pub const AttnBroadcast = struct {
         return out;
     }
 
-    /// What the cache holds now.
+    /// What the cache holds in memory now.
     pub fn bytes(self: *const AttnBroadcast) usize {
         var n: usize = 0;
         for (self.blocks) |b| inline for (.{ b.w, b.scales, b.biases }) |x| {
-            if (x.ctx != null) n += mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+            if (x.ctx != null) n += nbytes(x);
         };
         return n;
     }
@@ -3809,6 +3971,9 @@ pub const GenRequest = struct {
     /// Store the fast recipe's attention cache 8-bit (request `attn_cache_8bit`, default off):
     /// about half its bytes, LOSSY, so a render differs slightly from the bf16 cache's.
     attn_cache_8bit: bool = false,
+    /// Keep the fast recipe's attention cache in a scratch file in this directory (request
+    /// `attn_cache_disk`): memory holds one block's entry; a refresh writes it, a reused step reads it.
+    attn_cache_dir: ?[]const u8 = null,
     /// Style LoRAs stacked on the DiT: absolute `.safetensors` paths and their
     /// strengths (parallel arrays; a missing scale is 1.0 at the caller). They
     /// sum with each other and with Turbo, never merge — order is irrelevant
@@ -4721,7 +4886,9 @@ fn generateOne(
         const speed = req.speed;
         log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.turbo });
         const bcast_k: u32 = speed.bcast_k;
-        var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len, req.attn_cache_8bit) else null;
+        var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len, req.attn_cache_8bit, req.attn_cache_dir) else null;
+        if (attn_bcast != null and req.attn_cache_dir != null)
+            log.info("[minimax-h3] attention cache on disk in {s}\n", .{req.attn_cache_dir.?});
         defer if (attn_bcast) |*ab| ab.deinit();
         var bcast_reused: u32 = 0;
         const mem_cap = DenoiseMemCap.begin();
@@ -4844,7 +5011,7 @@ fn generateOne(
 
             const refresh = attnBroadcastRefresh(i, req.steps, bcast_k);
             if (attn_bcast != null and !refresh) bcast_reused += 1;
-            const bcast_growth: usize = if (attn_bcast) |*ab| @as(usize, @intCast(AttnBroadcast.rowBytes(model.cfg.hidden_size, model.blocks.len, ab.q8) * layout.seq_len)) -| ab.bytes() else 0;
+            const bcast_growth: usize = if (attn_bcast) |*ab| @as(usize, @intCast(AttnBroadcast.rowBytes(model.cfg.hidden_size, if (ab.spill != null) 1 else model.blocks.len, ab.q8) * layout.seq_len)) -| ab.bytes() else 0;
             mem_cap.step(bcast_growth);
             var out = try model.forward(&layout, &plan, refined, video_in, audio_in, rope, sigma, req.shift_video, req.shift_audio, if (attn_bcast) |*ab| ab else null, refresh, progress, s);
             defer out.deinit();
@@ -7199,7 +7366,7 @@ test "minimax h3: the 8-bit broadcast cache holds half the bytes and returns its
     const width = 256;
     const x = try bcastTestInput(rows, width, s);
     defer _ = mlx.mlx_array_free(x);
-    var ab = try AttnBroadcast.init(testing.allocator, 2, true);
+    var ab = try AttnBroadcast.init(testing.allocator, 2, true, null);
     defer ab.deinit();
     try testing.expect(!ab.has(1));
     const used = try ab.store(1, x, s);
@@ -7224,7 +7391,7 @@ test "minimax h3: the broadcast cache stays bf16 when 8-bit is off or the width 
     for ([_]struct { q8: bool, width: usize }{ .{ .q8 = false, .width = 256 }, .{ .q8 = true, .width = 96 } }) |c| {
         const x = try bcastTestInput(4, c.width, s);
         defer _ = mlx.mlx_array_free(x);
-        var ab = try AttnBroadcast.init(testing.allocator, 1, c.q8);
+        var ab = try AttnBroadcast.init(testing.allocator, 1, c.q8, null);
         defer ab.deinit();
         const used = try ab.store(0, x, s);
         defer _ = mlx.mlx_array_free(used);
@@ -7234,6 +7401,39 @@ test "minimax h3: the broadcast cache stays bf16 when 8-bit is off or the width 
         try testing.expectEqual(4 * c.width * 2, ab.bytes());
     }
     try testing.expectEqual(@as(u64, 50 * 5376 * 2), AttnBroadcast.rowBytes(5376, 50, false));
+}
+
+test "minimax h3: a broadcast cache on disk holds no memory and loads what the RAM cache loads" {
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = pbuf[0..try tmp.dir.realPath(std.testing.io, &pbuf)];
+    for ([_]bool{ true, false }) |q8| {
+        var ram = try AttnBroadcast.init(testing.allocator, 2, q8, null);
+        defer ram.deinit();
+        var disk = try AttnBroadcast.init(testing.allocator, 2, q8, dir);
+        defer disk.deinit();
+        // The second store replaces the first, as a refresh step does.
+        for ([_]usize{ 0, 3 }) |shift| {
+            const x = try bcastTestInput(16 + shift, 256, s);
+            defer _ = mlx.mlx_array_free(x);
+            inline for (.{ &ram, &disk }) |ab| {
+                const used = try ab.store(1, x, s);
+                defer _ = mlx.mlx_array_free(used);
+                try testing.expectEqual(@as(f32, 0), (try bcastTestDiff(used, x, s))[0]);
+            }
+            try testing.expect(disk.has(1) and !disk.has(0));
+            try testing.expectEqual(@as(usize, 0), disk.bytes());
+            const want = try ram.load(1, s);
+            defer _ = mlx.mlx_array_free(want);
+            const got = try disk.load(1, s);
+            defer _ = mlx.mlx_array_free(got);
+            try testing.expectEqual(mlx.mlx_array_ndim(want), mlx.mlx_array_ndim(got));
+            try testing.expectEqual(mlx.mlx_array_shape(want)[0], mlx.mlx_array_shape(got)[0]);
+            try testing.expectEqual(@as(f32, 0), (try bcastTestDiff(got, want, s))[0]);
+        }
+    }
 }
 
 /// Peak MLX memory above what was active, while evaluating a chain of 64 MB matmuls.

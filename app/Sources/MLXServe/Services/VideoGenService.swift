@@ -669,6 +669,7 @@ final class VideoGenService: ObservableObject {
         if request.model.supportsTurbo, request.turbo { body["turbo"] = true }
         if request.model.supportsWeightStreaming, !request.streamWeights { body["stream_weights"] = false }
         if request.model.supportsFastRecipe, request.fastRecipe, request.attnCache8bit { body["attn_cache_8bit"] = true }
+        if request.model.supportsFastRecipe, request.fastRecipe, request.attnCacheDisk { body["attn_cache_disk"] = true }
         if request.model.supportsChainedWindows, request.chainWindows > 1 {
             body["chain_windows"] = request.chainWindows
         }
@@ -784,6 +785,7 @@ final class VideoGenService: ObservableObject {
         }
         if request.model.supportsFastRecipe, request.fastRecipe {
             lines.append("attn_cache_8bit: \(request.attnCache8bit)")
+            lines.append("attn_cache_disk: \(request.attnCacheDisk)")
         }
         if request.model.supportsChainedWindows {
             lines.append("chain_windows: \(max(request.chainWindows, 1))")

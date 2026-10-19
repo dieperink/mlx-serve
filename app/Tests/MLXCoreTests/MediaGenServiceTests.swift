@@ -352,6 +352,18 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(body()["attn_cache_8bit"])
     }
 
+    /// The disk cache is opt-in and rides only a request that runs the fast recipe.
+    func testRequestBodySendsTheDiskCacheOnlyWhenAsked() {
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        func body() -> [String: Any] { VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil) }
+        XCTAssertNil(body()["attn_cache_disk"])
+        req.attnCacheDisk = true
+        XCTAssertEqual(body()["attn_cache_disk"] as? Bool, true)
+        req.bestQuality = true
+        XCTAssertNil(body()["attn_cache_disk"])
+    }
+
     func testStreamStartFailureSurfacesTheServersOwnMessage() {
         // The server's named 400s exist to tell the user what to do ("this
         // pack has no turbo_lora.safetensors — download …"); the stream path

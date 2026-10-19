@@ -445,6 +445,8 @@ struct VideoGenSettings: Codable, Equatable {
     var streamWeights: Bool = true
     /// H3's fast-recipe attention cache stored 8-bit (`attn_cache_8bit`, default off: lossy).
     var attnCache8bit: Bool = false
+    /// H3's fast-recipe attention cache kept on disk (`attn_cache_disk`, default off).
+    var attnCacheDisk: Bool = false
     /// Steps in LTX's two-stage refine pass. 0 = Auto (the server's own "all 3").
     var stage2Steps: Int = 0
     /// Audio-guidance strength for audio-to-video. The LTX reference default.
@@ -570,6 +572,7 @@ extension VideoGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .turbo) { turbo = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .streamWeights) { streamWeights = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .attnCache8bit) { attnCache8bit = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .attnCacheDisk) { attnCacheDisk = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .diffusionDecoder) { diffusionDecoder = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .stage2Steps) { stage2Steps = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .cfgAudioScale) { cfgAudioScale = v }

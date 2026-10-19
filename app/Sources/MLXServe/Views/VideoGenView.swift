@@ -104,6 +104,7 @@ struct VideoGenView: View {
     @State private var streamWeights: Bool = true
     /// H3's fast-recipe attention cache stored 8-bit (less memory, slightly lossy).
     @State private var attnCache8bit: Bool = false
+    @State private var attnCacheDisk: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
@@ -866,7 +867,7 @@ struct VideoGenView: View {
         let opts = model.frameOptions(width: effectiveSize.width, height: effectiveSize.height)
         let cap = RAMChecker.safeFrameCap(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                           available: RAMChecker.totalGB, fast: effectiveFast,
-                                          streamWeights: streamWeights, cache8bit: attnCache8bit)
+                                          streamWeights: streamWeights, cache8bit: attnCache8bit, cacheOnDisk: attnCacheDisk)
         let fits = opts.filter { $0 <= cap }
         return fits.isEmpty ? Array(opts.prefix(1)) : fits
     }
@@ -1036,7 +1037,7 @@ struct VideoGenView: View {
             available: total,
             fast: effectiveFast,
             streamWeights: streamWeights,
-            cache8bit: attnCache8bit
+            cache8bit: attnCache8bit, cacheOnDisk: attnCacheDisk
         )
         guard model.backend == .minimaxH3 else {
             guard numFrames > cap else { return nil }
@@ -1048,26 +1049,27 @@ struct VideoGenView: View {
         // no warning at all at exactly 124 frames.
         guard !H3Plan.fits(model: model, width: effectiveSize.width, height: effectiveSize.height,
                            frames: numFrames, fast: effectiveFast, turbo: turboEngaged, streamWeights: streamWeights,
-                           cache8bit: attnCache8bit, availableGB: total) else { return nil }
+                           cache8bit: attnCache8bit, cacheOnDisk: attnCacheDisk, availableGB: total) else { return nil }
         let gib = 1024.0 * 1024.0 * 1024.0
         let need = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                            frames: numFrames, fast: effectiveFast, turbo: turboEngaged,
-                                           streamWeights: streamWeights, cache8bit: attnCache8bit)) / gib
+                                           streamWeights: streamWeights, cache8bit: attnCache8bit, cacheOnDisk: attnCacheDisk)) / gib
         var out = String(format: "Needs about %.0f GB at this size and length; your Mac has %d GB. ", need, total)
         let floorFits = H3Plan.fits(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                     frames: cap, fast: effectiveFast, turbo: turboEngaged, streamWeights: streamWeights,
-                                    cache8bit: attnCache8bit, availableGB: total)
+                                    cache8bit: attnCache8bit, cacheOnDisk: attnCacheDisk, availableGB: total)
         out += floorFits && cap < numFrames ? "About \(cap) frames fits here" : "Try a smaller resolution"
         if !streamWeights {
             let streamed = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                                    frames: numFrames, fast: effectiveFast, turbo: turboEngaged,
-                                                   cache8bit: attnCache8bit)) / gib
+                                                   cache8bit: attnCache8bit, cacheOnDisk: attnCacheDisk)) / gib
             out += String(format: ", or turn on Stream the model from disk (%.0f GB)", streamed)
-        } else if effectiveFast, !attnCache8bit {
-            let q8 = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                                             frames: numFrames, fast: true, cache8bit: true)) / gib
-            if q8 < need - 2 {
-                out += String(format: ", or turn on Quantize the attention cache (%.0f GB)", q8)
+        } else if effectiveFast, !attnCacheDisk {
+            let disk = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                               frames: numFrames, fast: true, cache8bit: attnCache8bit,
+                                               cacheOnDisk: true)) / gib
+            if disk < need - 2 {
+                out += String(format: ", or turn on Keep the attention cache on disk (%.0f GB)", disk)
             }
         } else if effectiveFast {
             let slow = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
@@ -1086,7 +1088,7 @@ struct VideoGenView: View {
         let frames = storyboardOn ? shotFrames : [numFrames]
         let peak = H3Plan.describePeak(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                        shotFrames: frames, fast: effectiveFast, turbo: turboEngaged,
-                                       streamWeights: streamWeights, cache8bit: attnCache8bit)
+                                       streamWeights: streamWeights, cache8bit: attnCache8bit, cacheOnDisk: attnCacheDisk)
         return H3TimeEstimate.describeBest(
             model: model, width: effectiveSize.width, height: effectiveSize.height,
             shotFrames: frames, steps: steps, fast: effectiveFast, streamWeights: streamWeights,
@@ -1942,6 +1944,16 @@ struct VideoGenView: View {
                         .font(.app(.caption2)).foregroundStyle(.secondary)
                 }
             }
+            if model.supportsFastRecipe {
+                Toggle("Keep the attention cache on disk", isOn: $attnCacheDisk)
+                    .font(.app(.caption))
+                    .help("Off (default): the fast recipe holds its attention cache in memory. On: the cache goes to a scratch file in ~/.mlx-serve/cache and is read back one block at a time, so it takes almost no memory: tens of GB less on long, large clips. The video comes out the same, with no measurable slowdown on a fast internal SSD. It needs free disk space the size of the cache, and the file is gone when the run ends. Computing every step in full and Turbo keep no cache, so this does nothing there.")
+                    .disabled(!effectiveFast)
+                if effectiveFast {
+                    Text("Writes the attention cache to disk and reads it back per block: almost no memory for the cache, the same video, no measurable slowdown on a fast SSD. Needs free disk space the size of the cache.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                }
+            }
             if model.supportsWeightStreaming {
                 Toggle("Stream the model from disk", isOn: $streamWeights)
                     .font(.app(.caption))
@@ -2351,6 +2363,7 @@ struct VideoGenView: View {
         turbo = s.turbo && model.supportsTurbo
         streamWeights = s.streamWeights
         attnCache8bit = s.attnCache8bit
+        attnCacheDisk = s.attnCacheDisk
         // Clamp into the slider ranges — a value persisted by the old wider
         // steppers (Steps unbounded, CFG 0…20) would otherwise sit off-scale.
         steps = min(effectiveStepsRange.upperBound, max(effectiveStepsRange.lowerBound, s.steps))
@@ -2448,6 +2461,7 @@ struct VideoGenView: View {
         s.turbo = turbo
         s.streamWeights = streamWeights
         s.attnCache8bit = attnCache8bit
+        s.attnCacheDisk = attnCacheDisk
         s.promptHeight = PromptEditorHeight.clamp(promptHeight)
         s.loras = loras
         s.prompt = prompt
@@ -2573,6 +2587,7 @@ struct VideoGenView: View {
             turbo: turboEngaged,
             streamWeights: streamWeights,
             attnCache8bit: attnCache8bit,
+            attnCacheDisk: attnCacheDisk,
             // Gated here too: the stepper's value survives a preset switch,
             // and only the fl2va partition has a keyframe row to chain.
             chainWindows: model.supportsChainedWindows ? chainWindows : 1,

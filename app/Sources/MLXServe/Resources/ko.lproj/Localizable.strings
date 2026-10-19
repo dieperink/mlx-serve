@@ -2281,6 +2281,8 @@
 "Shows a rough still of each step while it runs, about 1% slower. The finished clip comes out sharper than the preview." = "실행 중 각 단계의 대략적인 정지 이미지를 보여 주며 약 1% 느려집니다. 완성된 클립은 미리보기보다 선명합니다.";
 "Adapter files (.safetensors) that change the look or teach the model a subject. Up to 8 stack, each with its own strength." = "모습을 바꾸거나 모델에 대상을 가르치는 어댑터 파일(.safetensors)입니다. 최대 8개를 겹칠 수 있고 각각 강도를 따로 정합니다.";
 "Quantize the attention cache" = "어텐션 캐시 양자화";
+"Keep the attention cache on disk" = "어텐션 캐시를 디스크에 보관";
+"Writes the attention cache to disk and reads it back per block: almost no memory for the cache, the same video, no measurable slowdown on a fast SSD. Needs free disk space the size of the cache." = "어텐션 캐시를 디스크에 쓰고 블록마다 다시 읽습니다. 캐시가 메모리를 거의 쓰지 않고, 영상은 같으며, 빠른 SSD에서는 느려짐이 측정되지 않습니다. 캐시 크기만큼의 여유 디스크 공간이 필요합니다.";
 "Cancel pause" = "일시 정지 취소";
 "Pausing after this step" = "이 단계가 끝나면 일시 정지합니다";
 "Pauses after the current step. Chat keeps working while paused; the model stays in memory." = "현재 단계가 끝나면 일시 정지합니다. 일시 정지 중에도 채팅은 계속 작동하며 모델은 메모리에 남아 있습니다.";

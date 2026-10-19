@@ -122,6 +122,7 @@ final class MediaGenSettingsTests: XCTestCase {
         s.turbo = true
         s.streamWeights = false
         s.attnCache8bit = true
+        s.attnCacheDisk = true
         s.stage2Steps = 4
         s.cfgAudioScale = 5.5
         s.chainWindows = 3
